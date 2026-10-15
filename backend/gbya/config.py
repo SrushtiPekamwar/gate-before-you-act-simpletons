@@ -1,0 +1,72 @@
+"""Application settings: ``config/app.yaml`` overridden by ``GBYA_*`` environment variables."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="GBYA_",
+        yaml_file=REPO_ROOT / "config" / "app.yaml",
+        extra="ignore",
+    )
+
+    env: Literal["dev", "test", "demo"] = "dev"
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    data_dir: Path = Path("data")
+    cases_dir: Path = Path("cases")  # scenario and case JSON files (in git)
+    app_db_path: Path = Path("data/app.db")
+    log_dir: Path = Path("logs")
+    frontend_dist: Path = Path("frontend/dist")
+    model_base_url: str = "http://127.0.0.1:8001/v1"
+    # LLM backend for the API and worker: the model server (live), a scripted fake (tests and the
+    # Playwright profile; never research) or a recorded cassette (replay; never research).
+    llm_backend: Literal["live", "fake", "replay"] = "live"
+    fake_llm_delay_ms: int = 0
+    replay_cassette: Path | None = None
+    # Demo recording (T8.2): every successful model call is also appended to this cassette, which
+    # ``llm_backend=replay`` later replays (``make demo-record``). Never set for research runs.
+    record_cassette: Path | None = None
+    # CPU reranker for bm25_rerank (A6); tests point this at a missing directory so that A6's
+    # availability does not depend on whether the model happens to be downloaded.
+    reranker_dir: Path = Path("models/bge-reranker-base")
+    worker_concurrency: int = 4
+    worker_heartbeat_s: int = 10
+    worker_stale_s: int = 60
+    # Budget monitor (T5.5): the planning figure until T8.0 regenerates the budget from real
+    # prompts and sets this value.
+    gpu_budget_hours: float = 81.0
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Precedence: explicit init args > environment > app.yaml.
+        return (init_settings, env_settings, YamlConfigSettingsSource(settings_cls))
+
+    def resolve(self, path: Path) -> Path:
+        """Resolve a configured path against the repository root."""
+        return path if path.is_absolute() else REPO_ROOT / path
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
