@@ -1,0 +1,63 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Route, Routes } from 'react-router'
+
+import { Layout } from './components/Layout'
+import { Home } from './pages/Home'
+import { WindowDetail } from './pages/WindowDetail'
+import { WindowsList } from './pages/WindowsList'
+import { NotBuilt } from './pages/NotBuilt'
+import { Playground } from './pages/Playground'
+import { Experiments } from './pages/Experiments'
+import { Scenarios } from './pages/Scenarios'
+import { Annotate, AnnotateScenario } from './pages/Annotate'
+import { ScenarioDetail } from './pages/ScenarioDetail'
+import { ExperimentRun } from './pages/ExperimentRun'
+import { Console } from './pages/Console'
+import { Trace, Traces } from './pages/Trace'
+import { Adjudicate } from './pages/Adjudicate'
+import { PAGES } from './pages/routes'
+import { Results, ResultsIndex } from './pages/Results'
+
+const BUILT = new Set([
+  '/',
+  '/windows',
+  '/playground',
+  '/experiments',
+  '/scenarios',
+  '/annotate',
+  '/console',
+  '/traces',
+  '/adjudicate',
+  '/results',
+])
+
+export function App({ queryClient }: { queryClient?: QueryClient }) {
+  const client = queryClient ?? new QueryClient()
+  return (
+    <QueryClientProvider client={client}>
+      <Routes>
+        <Route element={<Layout />}>
+          <Route index element={<Home />} />
+          <Route path="windows" element={<WindowsList />} />
+          <Route path="windows/:id" element={<WindowDetail />} />
+          <Route path="playground" element={<Playground />} />
+          <Route path="experiments" element={<Experiments />} />
+          <Route path="scenarios" element={<Scenarios />} />
+          <Route path="scenarios/:sid" element={<ScenarioDetail />} />
+          <Route path="annotate" element={<Annotate />} />
+          <Route path="annotate/:sid" element={<AnnotateScenario />} />
+          <Route path="experiments/:runId" element={<ExperimentRun />} />
+          <Route path="console" element={<Console />} />
+          <Route path="traces" element={<Traces />} />
+          <Route path="traces/:episodeId" element={<Trace />} />
+          <Route path="adjudicate" element={<Adjudicate />} />
+          <Route path="results" element={<ResultsIndex />} />
+          <Route path="results/:runId" element={<Results />} />
+          {PAGES.filter((p) => !BUILT.has(p.path)).map((p) => (
+            <Route key={p.path} path={`${p.path.slice(1)}/*`} element={<NotBuilt page={p} />} />
+          ))}
+        </Route>
+      </Routes>
+    </QueryClientProvider>
+  )
+}
