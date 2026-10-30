@@ -1,0 +1,425 @@
+"""Experiment runs API (plan §F.5, T3.5): create, control, progress (SSE) and Exp 1V results.
+
+The API only writes ``runs`` and ``jobs``; the worker process executes them. Exp 1 and Exp 2
+(Exp 3 arrives in M6).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session, sessionmaker
+from sse_starlette.sse import EventSourceResponse
+
+from gbya.api.deps import get_deps, get_session, get_settings
+from gbya.config import Settings
+from gbya.errors import NotFound, Unprocessable
+from gbya.experiments.exp1 import load_case
+from gbya.experiments.exp2 import create_exp2_run, outcome_counts
+from gbya.experiments.exp2 import load_spec as load_exp2_spec
+from gbya.experiments.runner import (
+    Deps,
+    case_query,
+    create_exp1_run,
+    load_spec,
+    progress,
+    variant_availability,
+)
+from gbya.experiments.runs import research_eligible
+from gbya.gate.config import load_configs
+from gbya.gate.ticket_scope import agreement
+from gbya.retrieval.gold import GoldMap, revoked_by
+from gbya.retrieval.index import query_hash
+from gbya.retrieval.metrics import RankedCase, retrieval_report
+from gbya.scoring.verifier_eval import (
+    C3Row,
+    CaseLabel,
+    EvalRow,
+    GateRow,
+    e2_c3_report,
+    verifier_report,
+)
+from gbya.store.models import (
+    Case,
+    GateDecisionRow,
+    Job,
+    JobItem,
+    RetrievalRanking,
+    Run,
+    VerifierEval,
+)
+
+router = APIRouter(prefix="/runs", tags=["runs"])
+TERMINAL = {"completed", "cancelled", "failed"}
+
+
+class RunCreate(BaseModel):
+    experiment: Literal[1, 2, 3] = 1
+    purpose: Literal["research", "development", "fixture", "demo"] = "development"
+    case_ids: list[str] | None = Field(default=None, max_length=5000)
+    config: dict[str, Any] | None = None  # overrides of experiments/exp<experiment>.yaml
+    start: bool = True
+
+
+class RunOut(BaseModel):
+    id: int
+    experiment: int
+    purpose: str
+    status: str
+    replay: bool
+    research_eligible: bool
+    config: dict[str, Any]
+    config_hash: str
+    case_set_hash: str | None
+    git_sha: str | None
+    model_id: str | None
+    model_file_sha256: str | None
+    backend: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    progress: dict[str, Any]
+
+
+def _out(session: Session, run: Run) -> RunOut:
+    def iso(t: Any) -> str | None:
+        return t.isoformat() if t is not None else None
+
+    return RunOut(
+        id=run.id, experiment=run.experiment, purpose=run.purpose, status=run.status,
+        replay=run.replay, research_eligible=research_eligible(run), config=run.config,
+        config_hash=run.config_hash, case_set_hash=run.case_set_hash, git_sha=run.git_sha,
+        model_id=run.model_id, model_file_sha256=run.model_file_sha256, backend=run.backend,
+        created_at=str(iso(run.created_at)), started_at=iso(run.started_at),
+        finished_at=iso(run.finished_at), progress=progress(session, run.id),
+    )  # fmt: skip
+
+
+def _run(session: Session, run_id: int) -> Run:
+    run = session.get(Run, run_id)
+    if run is None:
+        raise NotFound(f"No run {run_id}", code="RUN_NOT_FOUND")
+    return run
+
+
+def _active_job(session: Session, run_id: int) -> Job | None:
+    return session.scalar(select(Job).where(Job.run_id == run_id,
+                                            Job.status.in_(("queued", "running"))))  # fmt: skip
+
+
+@router.post("", response_model=RunOut, status_code=201)
+def create(
+    body: RunCreate,
+    session: Annotated[Session, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> RunOut:
+    from gbya.experiments.exp3 import create_exp3_run
+
+    create_run = {1: create_exp1_run, 2: create_exp2_run, 3: create_exp3_run}[body.experiment]
+    try:
+        run = create_run(session, settings, purpose=body.purpose, case_ids=body.case_ids,
+                         overrides=body.config, start=body.start)  # fmt: skip
+    except ValueError as exc:  # spec validation
+        raise Unprocessable(str(exc), code="INVALID_RUN_CONFIG") from exc
+    session.commit()
+    return _out(session, run)
+
+
+@router.get("/exp1-spec")
+def exp1_spec(deps: Annotated[Deps, Depends(get_deps)]) -> dict[str, Any]:
+    """The default Exp 1 configuration (``experiments/exp1.yaml``), the verifier variant of each
+    composed system and which variants cannot run here, for the run-creation form."""
+    spec = load_spec()
+    unavailable = {k: v for k, v in variant_availability(deps).items() if v is not None}
+    variant_of = {sid: deps.configs[sid].verifier_variant for sid in spec.composed}
+    return {"spec": spec.model_dump(), "unavailable": unavailable, "variant_of": variant_of}
+
+
+@router.get("/exp2-spec")
+def exp2_spec() -> dict[str, Any]:
+    """The default Exp 2 configuration (``experiments/exp2.yaml``) and which of its systems are
+    not defined yet (A7 with T5.7, A8 with T5.8)."""
+    spec = load_exp2_spec()
+    configs = load_configs()
+    return {"spec": spec.model_dump(mode="json"),
+            "undefined": [s for s in spec.systems if s not in configs]}  # fmt: skip
+
+
+@router.get("/{run_id}/outcomes")
+def outcomes(run_id: int, session: Annotated[Session, Depends(get_session)]) -> dict[str, Any]:
+    """Exp 2 outcome counts per system; ``unscored`` while a case's labels are pending."""
+    run = _run(session, run_id)
+    if run.experiment not in (2, 3):
+        raise Unprocessable("Outcomes exist for Exp 2 and Exp 3 runs only", code="NOT_EPISODES")
+    from gbya.scoring.metrics import MetricRefused, run_task_success
+
+    try:
+        rates = run_task_success(session, run_id)
+        task_success: dict[str, Any] = {
+            "by_system": {
+                s: {"rate": r.rate, "rate_pp": r.rate_pp, "n": r.n} for s, r in rates.items()
+            },
+            "refused": None,
+        }
+    except MetricRefused as exc:
+        task_success = {"by_system": {}, "refused": str(exc)}
+    out: dict[str, Any] = {"run_id": run_id, "by_system": outcome_counts(session, run_id),
+                           "task_success": task_success}  # fmt: skip
+    if run.experiment == 2:
+        from gbya.scoring.metrics import run_citation_gap
+
+        out["citation_gap"] = run_citation_gap(session, run_id)
+    if run.experiment == 3:
+        from gbya.experiments.exp3 import report
+
+        out["exp3"] = report(session, run_id)
+    return out
+
+
+@router.get("", response_model=list[RunOut])
+def list_runs(session: Annotated[Session, Depends(get_session)]) -> list[RunOut]:
+    return [_out(session, r) for r in session.scalars(select(Run).order_by(Run.id.desc()))]
+
+
+@router.get("/{run_id}", response_model=RunOut)
+def get_run(run_id: int, session: Annotated[Session, Depends(get_session)]) -> RunOut:
+    return _out(session, _run(session, run_id))
+
+
+@router.post("/{run_id}/start", response_model=RunOut)
+def start(run_id: int, session: Annotated[Session, Depends(get_session)]) -> RunOut:
+    run = _run(session, run_id)
+    if run.status in TERMINAL:
+        raise Unprocessable(f"Run {run_id} is {run.status}; use resume", code="RUN_FINISHED")
+    if _active_job(session, run_id) is None:
+        session.add(Job(run_id=run_id, status="queued"))
+    session.commit()
+    return _out(session, run)
+
+
+@router.post("/{run_id}/cancel", response_model=RunOut)
+def cancel(run_id: int, session: Annotated[Session, Depends(get_session)]) -> RunOut:
+    run = _run(session, run_id)
+    if run.status in ("completed", "failed"):
+        raise Unprocessable(f"Run {run_id} is already {run.status}", code="RUN_FINISHED")
+    run.status = "cancelled"
+    session.execute(update(Job).where(Job.run_id == run_id, Job.status == "queued")
+                    .values(status="cancelled"))  # fmt: skip
+    session.commit()
+    return _out(session, run)
+
+
+@router.post("/{run_id}/resume", response_model=RunOut)
+def resume(run_id: int, session: Annotated[Session, Depends(get_session)]) -> RunOut:
+    """Queue the run again; failed units get a fresh set of attempts."""
+    run = _run(session, run_id)
+    if run.status == "completed":
+        raise Unprocessable(f"Run {run_id} is complete", code="RUN_FINISHED")
+    session.execute(update(JobItem).where(JobItem.run_id == run_id, JobItem.status == "error")
+                    .values(status="queued", attempts=0))  # fmt: skip
+    run.status, run.finished_at = "queued", None
+    if _active_job(session, run_id) is None:
+        session.add(Job(run_id=run_id, status="queued"))
+    session.commit()
+    return _out(session, run)
+
+
+@router.get("/{run_id}/progress")
+async def progress_stream(run_id: int, request: Request) -> EventSourceResponse:
+    """Server-sent events: one ``progress`` event per second until the run is terminal."""
+    factory: sessionmaker[Session] = request.app.state.sessionmaker
+    limit_h = request.app.state.settings.gpu_budget_hours
+    with factory() as s:
+        _run(s, run_id)
+
+    async def events() -> AsyncIterator[dict[str, str]]:
+        while True:
+            with factory() as s:
+                p = progress(s, run_id, limit_h)
+            yield {"event": "progress", "data": json.dumps(p)}
+            if p["status"] in TERMINAL or await request.is_disconnected():
+                return
+            await asyncio.sleep(1.0)
+
+    return EventSourceResponse(events())
+
+
+@router.get("/{run_id}/items")
+def items(run_id: int, session: Annotated[Session, Depends(get_session)],
+          status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:  # fmt: skip
+    _run(session, run_id)
+    q = select(JobItem).where(JobItem.run_id == run_id)
+    if status:
+        q = q.where(JobItem.status == status)
+    rows = session.scalars(q.order_by(JobItem.id).limit(min(limit, 2000)))
+    return [{"case_id": r.case_id, "system": r.system, "run_idx": r.run_idx, "status": r.status,
+             "attempts": r.attempts, "error": r.error} for r in rows]  # fmt: skip
+
+
+@router.get("/{run_id}/results")
+def results(run_id: int, session: Annotated[Session, Depends(get_session)]) -> dict[str, Any]:
+    """Every FR-21 metric per system (T7.1; ``scoring/results.py``), with denominators; a metric
+    whose labels or adjudications are pending is refused, not estimated."""
+    from gbya.scoring.results import run_results
+
+    run = _run(session, run_id)
+    return run_results(session, run) | {"purpose": run.purpose, "replay": run.replay,
+                                        "research_eligible": research_eligible(run)}  # fmt: skip
+
+
+@router.get("/{run_id}/taxonomy")
+def taxonomy(run_id: int, session: Annotated[Session, Depends(get_session)]) -> dict[str, Any]:
+    """Error-taxonomy tag counts per system and the starred traces (T7.5)."""
+    from gbya.scoring.taxonomy import run_taxonomy
+
+    _run(session, run_id)
+    return run_taxonomy(session, run_id)
+
+
+@router.get("/{run_id}/verifier-eval")
+def verifier_eval(run_id: int, session: Annotated[Session, Depends(get_session)]) -> dict[str, Any]:
+    """Exp 1V diagnostic accuracy by verifier variant and case variant (with denominators), and
+    C4 invocation counts per gate configuration (§D.7.2)."""
+    run = _run(session, run_id)
+    evals = []
+    for ev in session.scalars(select(VerifierEval).where(VerifierEval.run_id == run_id)):
+        out = ev.output or {}
+        model_scope = (out.get("output") or {}).get("ticket_scope")
+        if (ev.manifest or {}).get("ticket_scope_constrained"):
+            model_scope = None  # fixed by the schema: nothing to compare
+        evals.append(EvalRow(ev.case_id, ev.variant, ev.run_idx, ev.verdict,
+                             agreement(model_scope, out.get("ticket_scope_code"))))  # fmt: skip
+    configs = load_configs()
+    gates = []
+    c3_rows = []
+    variants: dict[str, str] = {}
+    for r in session.scalars(select(GateDecisionRow).where(GateDecisionRow.run_id == run_id)):
+        if r.system in configs and "C3" in configs[r.system].checks:
+            if r.case_id not in variants:
+                row_case = session.get(Case, r.case_id)
+                variants[r.case_id] = row_case.variant if row_case else ""
+            c3 = next((c for c in r.checks if c["check"] == "C3"), None)
+            c3_rows.append(
+                C3Row(
+                    variants[r.case_id],
+                    r.system,
+                    str(r.call.get("tool")),
+                    c3 is not None and not c3["passed"],
+                )
+            )
+        if r.system not in configs or "C4" not in configs[r.system].checks:
+            continue
+        c4 = next((c for c in r.checks if c["check"] == "C4"), None)
+        out = (r.verifier or {}).get("output") or {}
+        gates.append(GateRow(r.case_id, r.system, r.run_idx, c4 is not None,
+                             out.get("verdict") if c4 is not None else None))  # fmt: skip
+    ids = {e.case_id for e in evals} | {g.case_id for g in gates}
+    labels = {}
+    for cid in ids:
+        case = session.get(Case, cid)
+        if case is not None:
+            labels[cid] = CaseLabel(case.variant, (case.labels or {}).get("verifier_label"))
+    report = verifier_report(evals, gates, labels)
+    return {"run_id": run_id, "purpose": run.purpose, "research_eligible": research_eligible(run),
+            "replay": run.replay, "backend": run.backend, **report,
+            "e2_c3": e2_c3_report(c3_rows)}  # fmt: skip
+
+
+@router.get("/{run_id}/retrieval")
+def retrieval(
+    run_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    deps: Annotated[Deps, Depends(get_deps)],
+) -> dict[str, Any]:
+    """Exp 1 retrieval metrics by mode and case variant (§D.3): Recall@5, Hit@5, nDCG@5, MRR@20,
+    ATT&CK top-1, mean |G|, exclusions.
+
+    Each case's ranking is the stored row of **its package query** (rebuilt exactly as C4 builds
+    it, matched by query hash), never the latest row of the case: Exp 2/3 and the Console store
+    their live retrievals under the same case id with the agent's own citations, and those rows
+    must not enter the Exp 1 metrics (defect found 2026-11-08). ``modes`` is the registered view
+    (labels as annotated; empty gold sets excluded). ``revoked_mapped`` (exploratory) maps a
+    ``technique_gold`` that the pinned ATT&CK bundle marks revoked to its replacement through
+    the bundle's ``revoked-by`` relationships only."""
+    run = _run(session, run_id)
+    if run.experiment != 1:
+        raise Unprocessable("Retrieval metrics are computed for Exp 1 runs only",
+                            code="NOT_EXP1")  # fmt: skip
+    s = deps.settings
+    index_dir = s.resolve(s.data_dir) / "index"
+    if not (index_dir / "MANIFEST.json").is_file():
+        raise Unprocessable("No retrieval index", code="NO_INDEX", hint="make index")
+    manifest = deps.index().manifest
+    index_sha = str(manifest["content_sha256"])
+    gold = GoldMap.load(index_dir)
+    ranked, missing, rerankers, ignored = [], [], set(), 0
+    for cid in run.config.get("case_ids", []):
+        case = session.get(Case, cid)
+        if case is None:
+            continue
+        labels = case.labels or {}
+        qh = query_hash(case_query(load_case(session, cid, s), deps.requirements))
+        for mode in ("bm25", "bm25_rerank"):
+            rows = session.scalars(select(RetrievalRanking).where(
+                RetrievalRanking.case_id == cid, RetrievalRanking.mode == mode,
+                RetrievalRanking.index_sha256 == index_sha,
+            ).order_by(RetrievalRanking.id.desc())).all()  # fmt: skip
+            own = [r for r in rows if r.query_hash == qh]
+            ignored += len(rows) - len(own)
+            if not own:
+                missing.append({"case_id": cid, "mode": mode})
+                continue
+            row = own[0]
+            if row.reranker:
+                rerankers.add(row.reranker)
+            ranked.append(RankedCase(
+                cid, case.variant, labels.get("technique_gold"), mode,
+                [h["doc_id"] for h in row.sigma_ranking],
+                row.attack_ranking[0]["doc_id"] if row.attack_ranking else None,
+            ))  # fmt: skip
+    return {
+        "run_id": run_id, "purpose": run.purpose, "research_eligible": research_eligible(run),
+        "index_sha256": index_sha, "rerankers": sorted(rerankers), "missing": missing,
+        "matched_by": "package query hash", "other_query_rows_ignored": ignored,
+        "modes": retrieval_report(ranked, gold),
+        "revoked_mapped": _revoked_view(ranked, gold, s.resolve(s.data_dir), manifest),
+        "note": "Technique tags are proxy relevance labels: technique-level retrieval, not "
+        "event-level relevance. Proportions.",
+    }  # fmt: skip
+
+
+def _revoked_view(ranked: list[RankedCase], gold: GoldMap, data_dir: Path,
+                  manifest: dict[str, Any]) -> dict[str, Any]:  # fmt: skip
+    """Exploratory view (b): gold mapped by the pinned bundle's ``revoked-by`` relationships."""
+    attack = manifest.get("attack") or {}
+    bundle = data_dir / "raw" / "attack" / str(attack.get("file", ""))
+    try:
+        mapping = revoked_by(bundle, str(attack.get("sha256", "")))
+    except (OSError, ValueError, KeyError) as exc:
+        return {"exploratory": True, "available": False, "reason": str(exc)}
+    remapped: dict[tuple[str, str], list[str]] = {}
+    cases = []
+    for c in ranked:
+        new = mapping.get(c.technique_gold or "")
+        if new is not None:
+            if c.mode == "bm25":
+                remapped.setdefault((str(c.technique_gold), new), []).append(c.case_id)
+            c = replace(c, technique_gold=new)
+        cases.append(c)
+    return {
+        "exploratory": True, "available": True,
+        "what": "technique_gold revoked in the pinned ATT&CK bundle mapped through its "
+        "revoked-by relationships only; registered metrics are in 'modes'",
+        "bundle": {"file": bundle.name, "sha256": attack.get("sha256")},
+        "remapped": [{"technique_gold": t, "mapped_to": n, "cases": sorted(ids)}
+                     for (t, n), ids in sorted(remapped.items())],
+        "modes": retrieval_report(cases, gold),
+    }  # fmt: skip
