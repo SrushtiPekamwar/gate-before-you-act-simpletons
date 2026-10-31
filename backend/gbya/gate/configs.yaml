@@ -1,0 +1,89 @@
+# Gate configurations (plan §D.6.4). Data, not code: runners never special-case a configuration.
+# T2.5: G0, G1, G2, G3, A1; T3.4: A2-A6; T5.7: A7; T5.8: A8. Every configuration states
+# retrieval_mode, recovery_budget and transport (null where C4 is absent).
+# Every configuration shares the same tool environment (allow-list = the case's toolset), the
+# same approval service and the same policy file; only the checks differ (§L.4 items 1 and 20).
+G0:
+  checks: []                 # schema only (A-7)
+  verifier_variant: null
+  retrieval_mode: null
+  recovery_budget: null
+  transport: in_process
+  capability: floor
+G1:
+  checks: [C1, C5, C6]       # C1 keeps full target validation and the typed-argument rule (A-8)
+  verifier_variant: null
+  retrieval_mode: null
+  recovery_budget: null
+  transport: in_process
+  capability: policy-only baseline
+G2:
+  checks: [C1, C2, C5, C6]
+  verifier_variant: null
+  retrieval_mode: null
+  recovery_budget: null
+  transport: in_process
+  capability: citation only
+G3:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: standard
+  retrieval_mode: bm25
+  recovery_budget: 2
+  transport: in_process
+  capability: proposed system
+A1:
+  checks: [C1, C2, C3, C5, C6]
+  verifier_variant: null
+  retrieval_mode: null
+  recovery_budget: null
+  transport: in_process
+  capability: "reasoning: no LLM verifier"
+A2:
+  checks: [C1, C2, C4, C5, C6]   # no C3: the verifier alone must catch a wrong target
+  verifier_variant: standard
+  retrieval_mode: bm25
+  recovery_budget: 2
+  transport: in_process
+  capability: "reasoning: no target match"
+A3:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: rationale    # the verifier also sees the agent's rationale
+  retrieval_mode: bm25
+  recovery_budget: 2
+  transport: in_process
+  capability: "reasoning: persuasion"
+A4:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: none         # no reference text
+  retrieval_mode: none
+  recovery_budget: 2
+  transport: in_process
+  capability: "RAG: no RAG"
+A5:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: standard
+  retrieval_mode: bm25
+  recovery_budget: 0             # no recovery queries after INSUFFICIENT (Exp 2 only)
+  transport: in_process
+  capability: "agentic: no recovery"
+A6:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: rerank       # BM25 top-20 re-scored by the CPU cross-encoder
+  retrieval_mode: bm25_rerank
+  recovery_budget: 2
+  transport: in_process
+  capability: "RAG: reranker"
+A7:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: standard
+  retrieval_mode: bm25
+  recovery_budget: 1             # one recovery query after INSUFFICIENT (Exp 2 only; T5.7)
+  transport: in_process
+  capability: "agentic: one recovery query"
+A8:
+  checks: [C1, C2, C3, C4, C5, C6]
+  verifier_variant: standard
+  retrieval_mode: bm25
+  recovery_budget: 2
+  transport: mcp                 # tools over a per-episode MCP stdio server; the gate runs there
+  capability: "tool calling: MCP transport"
