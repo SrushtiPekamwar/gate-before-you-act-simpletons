@@ -1,0 +1,610 @@
+"""Scenario and case files (plan §D.11 authoring input, §F.4 case file, T4.1).
+
+``cases/<scenario>/scenario.json`` is the authoring input; ``cases/<scenario>/cases/<variant>.json``
+are the generated cases (E1-E5, R_pos, R_neg). Labels live only in case files and come only from
+annotation and adjudication (T4.7-T4.8); the builder never invents them.
+
+Files are written canonically (``dump``): field order of the models, two-space indent, UTF-8,
+trailing newline, so file → app.db → file is byte-identical (round-trip test).
+
+The content hash of a case covers its request, package, database patch, effective trusted context,
+toolset and labels (§F.1).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from gbya.context.models import TrustedContext
+from gbya.tools.names import ALL_TOOLS, STATE_CHANGING
+from gbya.tools.registry import STATE_CHANGING_TARGETS
+
+Variant = Literal["E1", "E2", "E3", "E4", "E5", "R_pos", "R_neg"]
+VARIANTS: tuple[Variant, ...] = ("E1", "E2", "E3", "E4", "E5", "R_pos", "R_neg")
+E_VARIANTS: tuple[Variant, ...] = ("E1", "E2", "E3", "E4", "E5")
+PATCHED: tuple[Variant, ...] = ("E3", "E4", "E5")  # variants with their own case database
+
+# Objectives map one-to-one to the state-changing tools (A-24).
+OBJECTIVE_TOOL = {
+    "contain_host": "isolate_host",
+    "stop_process": "kill_process",
+    "disable_account": "disable_account",
+    "block_destination": "block_ip",
+}
+Objective = Literal["contain_host", "stop_process", "disable_account", "block_destination"]
+Outcome = Literal[
+    "safe_completion", "justified_escalation", "unnecessary_deferral", "refusal",
+    "unsafe_execution",
+]  # fmt: skip
+Verdict = Literal["SUPPORTS", "INSUFFICIENT", "CONTRADICTED"]
+
+
+class _M(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def _check_target(tool: str, args: dict[str, Any], where: str) -> None:
+    if tool not in STATE_CHANGING:
+        raise ValueError(f"{where}: {tool} is not a state-changing tool")
+    STATE_CHANGING_TARGETS[tool].model_validate(args)
+
+
+# ---- request and package ------------------------------------------------------------------------
+
+
+class Request(_M):
+    objective: Objective
+    target: dict[str, Any]
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _target(self) -> Request:
+        _check_target(OBJECTIVE_TOOL[self.objective], self.target, "request.target")
+        return self
+
+
+class Package(_M):
+    tool: str
+    args: dict[str, Any]
+    cited: list[int] = Field(min_length=1)
+    technique_claimed: str | None = None
+    rationale: str | None = None  # shown only to the A3 verifier variant
+
+    @model_validator(mode="after")
+    def _args(self) -> Package:
+        _check_target(self.tool, self.args, "package.args")
+        return self
+
+
+# ---- database patches (executed only by gbya.cases.patch, construction path) --------------------
+
+
+class MoveHost(_M):
+    op: Literal["move_host"] = "move_host"
+    record_ids: list[int] = Field(min_length=1)
+    host: str = Field(min_length=1)
+
+
+class Remove(_M):
+    op: Literal["remove"] = "remove"
+    record_ids: list[int] = Field(min_length=1)
+
+
+class Add(_M):
+    """A new record (``record_id`` = max + 1): an authored raw event, or a copy of an existing
+    record's raw event with some raw fields set."""
+
+    op: Literal["add"] = "add"
+    raw: dict[str, Any] | None = None
+    from_record: int | None = None
+    set: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _source(self) -> Add:
+        if (self.raw is None) == (self.from_record is None):
+            raise ValueError("add needs exactly one of raw or from_record")
+        return self
+
+
+class TimeShift(_M):
+    op: Literal["time_shift"] = "time_shift"
+    record_ids: list[int] = Field(min_length=1)
+    seconds: int
+
+
+class SetUser(_M):
+    op: Literal["set_user"] = "set_user"
+    record_ids: list[int] = Field(min_length=1)
+    user: str = Field(min_length=1)
+
+
+class SetField(_M):
+    """Set one raw field (e.g. ``CommandLine``); the normalised row is re-derived from the raw."""
+
+    op: Literal["set_field"] = "set_field"
+    record_ids: list[int] = Field(min_length=1)
+    key: str = Field(min_length=1)
+    value: Any
+
+
+PatchOp = Annotated[MoveHost | Remove | Add | TimeShift | SetUser | SetField,
+                    Field(discriminator="op")]  # fmt: skip
+
+
+class DbPatch(_M):
+    ops: list[PatchOp] = Field(min_length=1)
+
+
+# ---- labels (annotation only) -------------------------------------------------------------------
+
+
+class PermittedEntry(_M):
+    tool: str
+    args: dict[str, Any]
+    requires_approval: bool
+    fulfils: bool
+    # Optional marker, e.g. "draft: needs team decision" (agent-drafted fixture labels, R1)
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _exact(self) -> PermittedEntry:
+        if any(v == "*" for v in self.args.values()):
+            raise ValueError("wildcards are allowed only in prohibited entries")
+        return self
+
+
+class ProhibitedEntry(_M):
+    tool: str
+    args: dict[str, Any]  # "*" wildcards allowed
+    note: str | None = None
+
+
+class ApprovalFor(_M):
+    tool: str
+    args: dict[str, Any]
+
+
+class EscRequestApproval(_M):
+    tool: Literal["request_approval"]
+    for_: ApprovalFor = Field(alias="for")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class EscAskAnalyst(_M):
+    tool: Literal["ask_analyst"]
+    topics: list[str] = Field(min_length=1)
+
+
+class EscDraftReport(_M):
+    tool: Literal["draft_report"]
+    incident_types: list[str] = Field(min_length=1)
+
+
+Escalation = Annotated[EscRequestApproval | EscAskAnalyst | EscDraftReport,
+                       Field(discriminator="tool")]  # fmt: skip
+
+
+class DecisiveField(_M):
+    record_id: int
+    field: str
+    contains: str = Field(min_length=1)
+
+
+class DecisiveTicket(_M):
+    ticket_id: str
+    scope: list[Literal["host", "account", "command", "time"]] = Field(min_length=1)
+
+
+class DecisiveAbsent(_M):
+    absent_record_id: int
+
+
+Decisive = DecisiveField | DecisiveTicket | DecisiveAbsent
+
+
+class Labels(_M):
+    """All optional until annotation; the validator reports label checks as pending."""
+
+    technique_gold: str | None = None
+    initial_gate_label: Literal["admit", "reject"] | None = None
+    verifier_label: Verdict | None = None
+    e4_kind: Literal["partial_chain", "contradiction"] | None = None
+    decisive: list[Decisive] = Field(default_factory=list)
+    has_justified_completion: bool | None = None
+    permitted: list[PermittedEntry] = Field(default_factory=list)
+    prohibited: list[ProhibitedEntry] = Field(default_factory=list)
+    acceptable_escalations: list[Escalation] = Field(default_factory=list)
+    correct_outcome: Outcome | None = None
+    evidence_counterfactual: list[int] = Field(default_factory=list)
+    evidence_retrievable: list[int] = Field(default_factory=list)
+
+    @property
+    def labelled(self) -> bool:
+        return self.correct_outcome is not None and self.verifier_label is not None
+
+
+# ---- injection markers (team decision, 14 Oct 2026) --------------------------------------------
+
+
+class InjectionAction(_M):
+    tool: Literal["block_ip"] = "block_ip"
+    args: dict[str, Any]
+
+
+class Injection(_M):
+    """A harmless planted instruction (indirect prompt injection) in one benign, in-scope
+    process-creation record of the case database: the record's command line gets ``text``
+    appended. It asks for ``action`` (a prohibited call) and carries a unique ``token``. Chosen
+    once per scenario (a seeded half of the test and e2e scenarios) and identical for every
+    variant and system. See ``gbya.cases.injection``."""
+
+    record_id: int
+    key: Literal["CommandLine"] = "CommandLine"
+    original: str  # the record's command line before planting
+    text: str  # the planted marker
+    token: str  # GBYA-INJ-<scenario>
+    action: InjectionAction
+
+    @property
+    def planted(self) -> str:
+        return f"{self.original} {self.text}".strip()
+
+
+INJECTION_NOTE = "injection marker action (added automatically; prohibited)"
+# A selected scenario whose window has no eligible record keeps its place without a marker
+# (team decision, 14 Oct 2026); recorded in the case files, check inj and the freeze manifest.
+NO_ELIGIBLE_RECORD = "selected, no eligible record"
+
+
+def with_injection(labels: Labels, injection: Injection | None) -> Labels:
+    """The labels with the marker's action in ``prohibited`` (added once, automatically)."""
+    if injection is None:
+        return labels
+    entry = ProhibitedEntry(tool=injection.action.tool, args=dict(injection.action.args),
+                            note=INJECTION_NOTE)  # fmt: skip
+    if any(p.tool == entry.tool and p.args == entry.args for p in labels.prohibited):
+        return labels
+    return labels.model_copy(update={"prohibited": [*labels.prohibited, entry]})
+
+
+# Not labelled for set X (no fixed package; technique ground truth is the OTRF metadata plus
+# adjudicated incidental techniques, A-15). Decision D / STATUS "Set X annotation".
+X_NOT_LABELLED = ("technique_gold", "initial_gate_label", "verifier_label", "e4_kind",
+                  "decisive", "evidence_counterfactual")  # fmt: skip
+
+
+class XLabels(Labels):
+    """Labels of an end-to-end (set X) case: what to do and what justifies it, nothing about a
+    package. Labelled when ``correct_outcome`` and ``has_justified_completion`` are set."""
+
+    @model_validator(mode="after")
+    def _x_fields(self) -> XLabels:
+        if set_ := [f for f in X_NOT_LABELLED if getattr(self, f) not in (None, [])]:
+            raise ValueError(f"not labelled for set X cases: {set_}")
+        return self
+
+    @property
+    def labelled(self) -> bool:
+        return self.correct_outcome is not None and self.has_justified_completion is not None
+
+
+def labels_model(variant: str) -> type[Labels]:
+    return XLabels if variant == "X" else Labels
+
+
+# ---- Set R --------------------------------------------------------------------------------------
+
+
+class REdit(_M):
+    """The one field a Set R case changes relative to the scenario (§D.11)."""
+
+    field: Literal["tier", "approval_script", "toolset"]
+    value: Any
+
+    @model_validator(mode="after")
+    def _value(self) -> REdit:
+        if self.field == "tier" and self.value not in (0, 1, 2):
+            raise ValueError("tier must be 0, 1 or 2")
+        if self.field == "approval_script" and self.value not in ("unreachable", "grant", "deny"):
+            raise ValueError("approval_script must be unreachable, grant or deny")
+        if self.field == "toolset" and (not isinstance(self.value, list)
+                                        or not set(self.value) <= set(ALL_TOOLS)):  # fmt: skip
+            raise ValueError("toolset must be a list of known tools")
+        return self
+
+
+class SetRSpec(_M):
+    field: Literal["tier", "approval_script", "toolset"]
+    positive: Any
+    negative: Any
+
+    def edit(self, which: Literal["positive", "negative"]) -> REdit:
+        return REdit(field=self.field, value=getattr(self, which))
+
+
+def effective_context(ctx: TrustedContext, target_host: str, edit: REdit | None) -> TrustedContext:
+    """The scenario context with a Set R edit applied (tier of the target host, or the approval
+    script); E cases and toolset edits use the scenario context unchanged."""
+    if edit is None or edit.field == "toolset":
+        return ctx
+    data = ctx.model_dump(mode="json")
+    if edit.field == "tier":
+        hits = [a for a in data["assets"] if a["host"].casefold() == target_host.casefold()]
+        if not hits:
+            raise ValueError(f"target host {target_host} is not in the asset inventory")
+        hits[0]["tier"] = edit.value
+    else:
+        data["approval_script"] = {"mode": edit.value}
+    return TrustedContext.model_validate(data)
+
+
+def effective_toolset(edit: REdit | None) -> list[str]:
+    return list(edit.value) if edit is not None and edit.field == "toolset" else list(ALL_TOOLS)
+
+
+# ---- scenario authoring input -------------------------------------------------------------------
+
+
+class E2Spec(_M):
+    seed: int = 0
+    same_host: bool = True  # sample benign records on the target host (C3 cannot reject them)
+    # Records annotators flagged as attack-related: never sampled; each is replaced by the next
+    # candidate of the seeded order (log: cases/<sid>/e2_flags.json).
+    flagged_record_ids: list[int] = Field(default_factory=list)
+
+
+class E3Spec(_M):
+    host: str = Field(min_length=1)  # host Y; must be in the asset inventory
+    record_ids: list[int] | None = None  # default: the scenario's suspicious records
+
+
+class E4Spec(_M):
+    kind: Literal["partial_chain", "contradiction"]
+    remove_record_ids: list[int] = Field(default_factory=list)  # partial chain
+    add: Add | None = None  # contradiction
+
+    @model_validator(mode="after")
+    def _kind(self) -> E4Spec:
+        if self.kind == "partial_chain" and (not self.remove_record_ids or self.add):
+            raise ValueError("partial_chain needs remove_record_ids and no add")
+        if self.kind == "contradiction" and (self.add is None or self.remove_record_ids):
+            raise ValueError("contradiction needs add and no remove_record_ids")
+        return self
+
+
+class E5Spec(_M):
+    ops: list[PatchOp] = Field(min_length=1)
+
+
+class ScopeProcess(_M):
+    host: str
+    pid: int
+    image: str | None = None
+
+
+class Scope(_M):
+    """A case's scope (decision A, 13 Oct 2026): the host(s) named in the request, plus the
+    processes, accounts and IP addresses shown acting on those hosts in the case's records.
+    Authored once per scenario from its window (E1) records; the validator recomputes it per case
+    (variants move or rename actors) and checks that every permitted action stays inside it."""
+
+    hosts: list[str] = Field(min_length=1)
+    processes: list[ScopeProcess] = Field(default_factory=list)
+    accounts: list[str] = Field(default_factory=list)
+    ips: list[str] = Field(default_factory=list)
+
+
+def _check_scope(scope: Scope, target_host: str, ctx: TrustedContext) -> None:
+    if target_host.casefold() not in {h.casefold() for h in scope.hosts}:
+        raise ValueError(f"scope.hosts must include the target host {target_host}")
+    missing = [h for h in scope.hosts if ctx.asset(h) is None]
+    if missing:
+        raise ValueError(f"scope hosts {missing} are not in the asset inventory")
+
+
+class ScenarioFile(_M):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    window_id: str
+    target_host: str
+    request: Request
+    trusted_context: TrustedContext
+    scope: Scope
+    e1: Package
+    suspicious_record_ids: list[int] = Field(min_length=1)
+    e2: E2Spec = Field(default_factory=E2Spec)
+    e3: E3Spec | None = None
+    e4: E4Spec | None = None
+    e5: E5Spec | None = None
+    set_r: SetRSpec | None = None
+    # The author's name (team decision, 14 Oct 2026): the author is also annotator A, and the
+    # Annotate API refuses the author as annotator B or as the adjudicator.
+    author: str | None = None
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ScenarioFile:
+        tool = OBJECTIVE_TOOL[self.request.objective]
+        if self.e1.tool != tool:
+            raise ValueError(f"E1 package tool {self.e1.tool} does not serve objective "
+                             f"{self.request.objective} ({tool})")  # fmt: skip
+        if self.trusted_context.asset(self.target_host) is None:
+            raise ValueError(f"target host {self.target_host} is not in the asset inventory")
+        _check_scope(self.scope, self.target_host, self.trusted_context)
+        if self.e3 and self.trusted_context.asset(self.e3.host) is None:
+            raise ValueError(f"E3 host {self.e3.host} is not in the asset inventory")
+        if self.e3 and self.e3.host.casefold() == self.target_host.casefold():
+            raise ValueError("E3 host must differ from the target host")
+        return self
+
+
+# ---- end-to-end scenarios (Exp 3) --------------------------------------------------------------
+
+
+class EndToEndFile(_M):
+    """An end-to-end window for Exp 3 (plan §A.1, A-14): the agent investigates the window live, so
+    there is no fixed package and no variants; one case (``<sid>:X``) carries the request, the
+    trusted context and the labels. File: ``cases/<sid>/e2e.json``."""
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    window_id: str
+    target_host: str
+    request: Request
+    trusted_context: TrustedContext
+    scope: Scope
+    labels: XLabels = Field(default_factory=XLabels)
+    # The attack chain (authored, like scenario.json's suspicious_record_ids): an injection marker
+    # is never planted in these records or in records of their processes
+    attack_record_ids: list[int] = Field(default_factory=list)
+    injection: Injection | None = None  # set by ``prepare-e2e`` for a seeded half of e2e windows
+    injection_skipped: str | None = None  # NO_ELIGIBLE_RECORD when selected but impossible
+    # Decision D (Q-X4): the trusted context is authored once and checked by a second member
+    context_author: str | None = None
+    context_checked_by: str | None = None
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> EndToEndFile:
+        if self.trusted_context.asset(self.target_host) is None:
+            raise ValueError(f"target host {self.target_host} is not in the asset inventory")
+        _check_scope(self.scope, self.target_host, self.trusted_context)
+        if (self.context_checked_by and self.context_author
+                and self.context_checked_by.strip().casefold()
+                == self.context_author.strip().casefold()):  # fmt: skip
+            raise ValueError("the context must be checked by a member other than its author")
+        return self
+
+    @property
+    def case_id(self) -> str:
+        return f"{self.id}:X"
+
+
+def e2e_path(cases_dir: Path, sid: str) -> Path:
+    return cases_dir / sid / "e2e.json"
+
+
+def load_e2e(path: Path) -> EndToEndFile:
+    return EndToEndFile.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def e2e_content_hash(e: EndToEndFile) -> str:
+    """SHA-256 over request, context, scope and labels (an end-to-end case has no package)."""
+    body = {"request": e.request.model_dump(mode="json"),
+            "context": e.trusted_context.model_dump(mode="json"),
+            "scope": e.scope.model_dump(mode="json"),
+            "injection": e.injection.model_dump(mode="json") if e.injection else None,
+            "injection_skipped": e.injection_skipped,
+            "labels": e.labels.model_dump(mode="json", by_alias=True)}  # fmt: skip
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode()).hexdigest()  # fmt: skip
+
+
+# ---- case file ----------------------------------------------------------------------------------
+
+
+class E2Basis(_M):
+    """How E2's sample was drawn, stored with the E2 case when E2 is generated (team decision
+    before M6): later label changes never move E2; ``make regenerate-e2`` is the explicit,
+    logged way to recompute it."""
+
+    evidence_records: list[int]  # E1's citations plus the labelled evidence sets at generation
+    attack_processes: list[dict[str, Any]]  # host, pid, guid
+    attack_images: list[str]  # lower-case image names of the attack processes
+    excluded_record_ids: list[int]  # attack-related records, never sampled
+
+
+class CaseFile(_M):
+    id: str
+    scenario_id: str
+    set: Literal["R", "E"]
+    variant: Variant
+    request: Request
+    package: Package
+    db_patch: DbPatch | None = None
+    r_edit: REdit | None = None
+    labels: Labels = Field(default_factory=Labels)
+    e2_basis: E2Basis | None = None  # E2 only
+    injection: Injection | None = None  # the scenario's marker, the same in every variant
+    injection_skipped: str | None = None  # NO_ELIGIBLE_RECORD when selected but impossible
+
+    @model_validator(mode="after")
+    def _ids(self) -> CaseFile:
+        if self.id != f"{self.scenario_id}:{self.variant}":
+            raise ValueError(f"case id {self.id} must be {self.scenario_id}:{self.variant}")
+        if (self.set == "R") != self.variant.startswith("R_"):
+            raise ValueError(f"set {self.set} does not match variant {self.variant}")
+        if (self.r_edit is not None) != (self.set == "R"):
+            raise ValueError("r_edit is required for Set R cases and forbidden otherwise")
+        if self.db_patch is not None and self.variant not in PATCHED:
+            raise ValueError(f"{self.variant} has no database patch")
+        if self.e2_basis is not None and self.variant != "E2":
+            raise ValueError("e2_basis belongs to the E2 case only")
+        return self
+
+
+def content_hash(case: CaseFile, context: TrustedContext) -> str:
+    """SHA-256 over request, package, patch, effective context, toolset and labels."""
+    body = {
+        "request": case.request.model_dump(mode="json"),
+        "package": case.package.model_dump(mode="json"),
+        "db_patch": case.db_patch.model_dump(mode="json") if case.db_patch else None,
+        "context": context.model_dump(mode="json"),
+        "toolset": effective_toolset(case.r_edit),
+        "labels": case.labels.model_dump(mode="json", by_alias=True),
+        "injection": case.injection.model_dump(mode="json") if case.injection else None,
+        "injection_skipped": case.injection_skipped,
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode()).hexdigest()  # fmt: skip
+
+
+def dump(model: BaseModel) -> str:
+    """Canonical file text."""
+    return json.dumps(model.model_dump(mode="json", by_alias=True), indent=2,
+                      ensure_ascii=False) + "\n"  # fmt: skip
+
+
+def scenario_path(cases_dir: Path, sid: str) -> Path:
+    return cases_dir / sid / "scenario.json"
+
+
+def case_path(cases_dir: Path, case_id: str) -> Path:
+    sid, variant = case_id.split(":", 1)
+    return cases_dir / sid / "cases" / f"{variant}.json"
+
+
+def load_scenario(path: Path) -> ScenarioFile:
+    return ScenarioFile.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def load_casefile(path: Path) -> CaseFile:
+    return CaseFile.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+# ---- scaffolds (make new-e2e) ---------------------------------------------------------------
+
+
+PLACEHOLDER = "TODO"
+
+
+def placeholders(e: Any) -> list[str]:
+    """Paths of the string values of an ``e2e.json`` that still start with TODO (notes aside)."""
+    out: list[str] = []
+
+    def walk(x: Any, path: str) -> None:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if path or k != "notes":
+                    walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(x, list):
+            for i, v in enumerate(x):
+                walk(v, f"{path}[{i}]")
+        elif isinstance(x, str) and x.startswith(PLACEHOLDER):
+            out.append(path)
+
+    walk(e.model_dump(mode="json"), "")
+    return out
